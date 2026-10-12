@@ -142,13 +142,18 @@ export function deleteAttachment(attach, clientMutationLabel) {
   });
 }
 
-export function downloadAttachment(attach) {
+export function fetchAttachmentBlob(attach) {
   var url = new URL(`${window.location.origin}${baseApiUrl}/claim/attach`);
   url.search = new URLSearchParams({ id: decodeId(attach.id) });
+  return fetch(url).then((response) => {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.blob();
+  });
+}
+
+export function downloadAttachment(attach) {
   return (dispatch) => {
-    return fetch(url)
-      .then((response) => response.blob())
-      .then((blob) => openBlob(blob, attach.filename, attach.mime));
+    return fetchAttachmentBlob(attach).then((blob) => openBlob(blob, attach.filename, attach.mime));
   };
 }
 

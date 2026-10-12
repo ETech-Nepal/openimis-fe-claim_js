@@ -12,12 +12,14 @@ import {
   DialogContent,
   Link,
   IconButton,
+  Badge,
 } from "@material-ui/core";
 import { withTheme, withStyles } from "@material-ui/core/styles";
 import SaveIcon from "@material-ui/icons/Save";
 import DeleteIcon from "@material-ui/icons/Delete";
 import FileIcon from "@material-ui/icons/Add";
 import LinkIcon from "@material-ui/icons/Link";
+import PreviewIcon from "@material-ui/icons/Visibility";
 
 import {
   FormattedMessage,
@@ -35,6 +37,7 @@ import {
 } from "@openimis/fe-core";
 import {
   fetchClaimAttachments,
+  fetchAttachmentBlob,
   downloadAttachment,
   deleteAttachment,
   createAttachment,
@@ -46,7 +49,92 @@ import AttachmentGeneralTypePicker from "../pickers/AttachmentGeneralTypePicker"
 const styles = (theme) => ({
   dialogTitle: theme.dialog.title,
   dialogContent: theme.dialog.content,
+  viewAll: {
+    display: "flex",
+    gap: theme.spacing(2),
+    margin: theme.spacing(1, 3),
+    justifyContent: "center",
+    flexWrap: "wrap",
+  },
 });
+
+const VIEWER_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Attachment viewer</title>
+<style>
+  body { margin: 0; font-family: Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; background: #f5f5f5; }
+  .header { background: #1976d2; color: white; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+  .meta { min-width: 0; }
+  .meta .name { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta .sub { font-size: 12px; opacity: .9; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+  .group { display: flex; gap: 4px; align-items: center; background: rgba(255,255,255,.15); padding: 4px 8px; border-radius: 4px; }
+  .group .label { font-size: 12px; margin: 0 4px; white-space: nowrap; }
+  button, a.button { padding: 6px 12px; background: white; color: #1976d2; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; text-decoration: none; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  #stage { flex: 1; min-height: 0; display: flex; }
+  iframe, img { flex: 1; min-height: 0; width: 100%; border: none; background: white; }
+  img { object-fit: contain; }
+  .message { margin: auto; text-align: center; color: #555; }
+  .message p { margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="meta"><div class="name" id="fname"></div><div class="sub" id="fsub"></div></div>
+  <div class="controls">
+    <span class="group" id="pageGroup">
+      <button id="prevPage">&#8249; Page</button><span class="label" id="pageLabel"></span><button id="nextPage">Page &#8250;</button>
+    </span>
+    <span class="group" id="fileGroup">
+      <button id="prevFile">&#8249; File</button><span class="label" id="fileLabel"></span><button id="nextFile">File &#8250;</button>
+    </span>
+    <button id="closeBtn">Close</button>
+  </div>
+</div>
+<div id="stage"></div>
+</body>
+</html>`;
+
+// Mime from the file's magic bytes: the stored mime can be empty or wrong.
+function sniffMime(bytes) {
+  const starts = (...sig) => sig.every((b, i) => bytes[i] === b);
+  if (starts(0x25, 0x50, 0x44, 0x46)) return "application/pdf";
+  if (starts(0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (starts(0x89, 0x50, 0x4e, 0x47)) return "image/png";
+  if (starts(0x47, 0x49, 0x46, 0x38)) return "image/gif";
+  if (starts(0x42, 0x4d)) return "image/bmp";
+  if (starts(0x52, 0x49, 0x46, 0x46) && bytes[8] === 0x57 && bytes[9] === 0x45) return "image/webp";
+  return null;
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(String(b64).replace(/\s/g, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// Page count read from the PDF's page tree (/Type /Pages ... /Count N), without pdf.js.
+// 0 means unknown (e.g. the tree sits in a compressed object stream): paging is then unbounded.
+function pdfPageCount(bytes) {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    text += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  let max = 0;
+  const re = /\/Type\s*\/Pages\b/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const c = /\/Count\s+(\d+)/.exec(text.slice(Math.max(0, m.index - 300), m.index + 300));
+    if (c) max = Math.max(max, parseInt(c[1], 10));
+  }
+  if (max > 0) return max;
+  const singles = text.match(/\/Type\s*\/Page[^s]/g);
+  return singles ? singles.length : 0;
+}
 
 class AttachmentsDialog extends Component {
   constructor(props) {
@@ -271,6 +359,147 @@ class AttachmentsDialog extends Component {
 
   download = (a) => {
     this.props.downloadAttachment(a);
+  };
+
+  isPreviewable = (a) =>
+    !!a && !!a.filename && !a.url && a.generalType !== URL_TYPE_STRING && (!!a.id || !!a.document);
+
+  // Saved attachments come from /claim/attach; ones not saved yet (new claim) carry their base64 document.
+  loadPreview = async (a) => {
+    const bytes = a.document
+      ? base64ToBytes(a.document)
+      : new Uint8Array(await (await fetchAttachmentBlob(a)).arrayBuffer());
+    const mime = sniffMime(bytes) || a.mime || "application/octet-stream";
+    return {
+      url: URL.createObjectURL(new Blob([bytes], { type: mime })),
+      mime,
+      pages: mime === "application/pdf" ? pdfPageCount(bytes) : 1,
+    };
+  };
+
+  // Opens a popup that pages through the given attachments (and through the pages of a PDF).
+  // The popup is opened synchronously, before anything is fetched, so popup blockers allow it.
+  openViewer = (attachments, startIndex = 0) => {
+    if (!attachments.length) return;
+    const { intl } = this.props;
+    const popup = window.open("", "_blank", "width=900,height=700,resizable,scrollbars");
+    if (!popup) {
+      this.props.coreAlert(
+        formatMessage(intl, "claim", "claim.attachment.viewer.blocked.title"),
+        formatMessage(intl, "claim", "claim.attachment.viewer.blocked.message"),
+      );
+      return;
+    }
+    popup.document.open();
+    popup.document.write(VIEWER_HTML);
+    popup.document.close();
+
+    const $ = (id) => popup.document.getElementById(id);
+    const previews = {}; // index -> Promise of { url, mime, pages }
+    const load = (i) => (previews[i] = previews[i] || this.loadPreview(attachments[i]));
+    let fileIndex = startIndex;
+    let pageIndex = 1;
+
+    const message = (text, a, preview) => {
+      const box = popup.document.createElement("div");
+      box.className = "message";
+      const p = popup.document.createElement("p");
+      p.textContent = text;
+      box.appendChild(p);
+      if (preview) {
+        const link = popup.document.createElement("a");
+        link.className = "button";
+        link.href = preview.url;
+        link.download = a.filename || "attachment";
+        link.textContent = formatMessage(intl, "claim", "claim.attachment.viewer.download");
+        box.appendChild(link);
+      }
+      return box;
+    };
+
+    const render = async () => {
+      const i = fileIndex;
+      const a = attachments[i];
+      $("fname").textContent = a.title ? `${a.title} (${a.filename})` : a.filename;
+      $("fsub").textContent = [a.type, a.date].filter(Boolean).join(" · ");
+      popup.document.title = a.filename || "Attachment";
+      $("fileGroup").style.display = attachments.length > 1 ? "flex" : "none";
+      $("fileLabel").textContent = `${i + 1}/${attachments.length}`;
+      $("prevFile").disabled = i === 0;
+      $("nextFile").disabled = i === attachments.length - 1;
+      $("pageGroup").style.display = "none";
+      const stage = $("stage");
+      stage.replaceChildren(message(formatMessage(intl, "claim", "claim.attachment.viewer.loading")));
+
+      let preview;
+      try {
+        preview = await load(i);
+      } catch (e) {
+        if (i === fileIndex) {
+          delete previews[i];
+          stage.replaceChildren(message(formatMessage(intl, "claim", "claim.attachment.viewer.error")));
+        }
+        return;
+      }
+      if (i !== fileIndex || popup.closed) return; // the user moved on while it loaded
+
+      const { pages } = preview;
+      if (pageIndex < 1) pageIndex = 1;
+      if (pages > 0 && pageIndex > pages) pageIndex = pages;
+      const isPdf = preview.mime === "application/pdf";
+      $("pageGroup").style.display = isPdf && pages !== 1 ? "flex" : "none";
+      $("pageLabel").textContent = pages > 0 ? `${pageIndex}/${pages}` : `${pageIndex}`;
+      $("prevPage").disabled = pageIndex <= 1;
+      $("nextPage").disabled = pages > 0 && pageIndex >= pages;
+
+      if (preview.mime.startsWith("image/")) {
+        const img = popup.document.createElement("img");
+        img.src = preview.url;
+        stage.replaceChildren(img);
+      } else if (isPdf || preview.mime.startsWith("text/")) {
+        const frame = popup.document.createElement("iframe");
+        // #page=N is understood by the built-in PDF viewers of Chrome and Firefox
+        frame.src = isPdf && pages !== 1 ? `${preview.url}#page=${pageIndex}` : preview.url;
+        stage.replaceChildren(frame);
+      } else {
+        stage.replaceChildren(message(formatMessage(intl, "claim", "claim.attachment.viewer.noPreview"), a, preview));
+      }
+    };
+
+    const goPage = (delta) => {
+      pageIndex += delta;
+      render();
+    };
+    const goFile = (delta) => {
+      const next = fileIndex + delta;
+      if (next < 0 || next >= attachments.length) return;
+      fileIndex = next;
+      pageIndex = 1;
+      render();
+    };
+    $("prevPage").onclick = () => goPage(-1);
+    $("nextPage").onclick = () => goPage(1);
+    $("prevFile").onclick = () => goFile(-1);
+    $("nextFile").onclick = () => goFile(1);
+    $("closeBtn").onclick = () => popup.close();
+    popup.document.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowRight") goFile(1);
+      else if (e.key === "ArrowLeft") goFile(-1);
+      else if (e.key === "PageDown") goPage(1);
+      else if (e.key === "PageUp") goPage(-1);
+      else if (e.key === "Escape") popup.close();
+    });
+    // Free the blob URLs when the viewer goes away
+    popup.addEventListener("pagehide", () =>
+      Object.values(previews).forEach((p) => p.then((pv) => URL.revokeObjectURL(pv.url), () => null)),
+    );
+
+    render();
+  };
+
+  preview = (attachment) => {
+    const viewable = this.state.claimAttachments.filter(this.isPreviewable);
+    this.openViewer(viewable, Math.max(0, viewable.indexOf(attachment)));
   };
 
   fileSelected = (f, i) => {
@@ -507,25 +736,47 @@ class AttachmentsDialog extends Component {
           : this.formatFileName(attachment, index),
     ];
 
-    if (!readOnly) {
-      headers.push("claimAttachment.action");
-      itemFormatters.push((attachment, index) => {
-        if (attachment.id && updatedAttachments.has(index)) {
-          return (
-            <IconButton onClick={(e) => this.update(index)}>
-              <SaveIcon />
-            </IconButton>
-          );
-        } else if (index < claimAttachments.length - 1) {
-          return (
+    headers.push("claimAttachment.action");
+    itemFormatters.push((attachment, index) => {
+      if (!readOnly && attachment.id && updatedAttachments.has(index)) {
+        return (
+          <IconButton onClick={(e) => this.update(index)}>
+            <SaveIcon />
+          </IconButton>
+        );
+      }
+      const showPreview = this.isPreviewable(attachment);
+      const showDelete = !readOnly && index < claimAttachments.length - 1;
+      if (!showPreview && !showDelete) return null;
+      return (
+        <div style={{ display: "flex", alignItems: "center" }}>
+          {showPreview &&
+            withTooltip(
+              <IconButton onClick={(e) => this.preview(attachment)}>
+                <PreviewIcon />
+              </IconButton>,
+              formatMessage(this.props.intl, "claim", "claim.attachment.preview"),
+            )}
+          {showDelete && (
             <IconButton onClick={(e) => this.delete(attachment, index)}>
               <DeleteIcon />
             </IconButton>
-          );
-        }
-        return null;
-      });
-    }
+          )}
+        </div>
+      );
+    });
+
+    // "View all" plus one button per attachment type (Prescription, Lab report, ...)
+    const viewable = claimAttachments.filter(this.isPreviewable);
+    const types = [...new Set(viewable.map((a) => (a.type || "").trim()).filter(Boolean))].sort();
+    const viewGroups = viewable.length
+      ? [
+          { key: "all", label: formatMessage(this.props.intl, "claim", "claim.attachment.viewAll"), items: viewable },
+          ...(types.length > 1 || viewable.some((a) => !(a.type || "").trim())
+            ? types.map((t) => ({ key: t, label: t, items: viewable.filter((a) => (a.type || "").trim() === t) }))
+            : []),
+        ]
+      : [];
 
     return (
       <Dialog
@@ -548,6 +799,17 @@ class AttachmentsDialog extends Component {
             <Table module="claim" items={claimAttachments} headers={headers} itemFormatters={itemFormatters} />
           )}
         </DialogContent>
+        {!fetchingClaimAttachments && !errorClaimAttachments && viewGroups.length > 0 && (
+          <div className={classes.viewAll}>
+            {viewGroups.map((g) => (
+              <Badge key={g.key} badgeContent={g.items.length} color="primary">
+                <Button variant="outlined" color="primary" startIcon={<PreviewIcon />} onClick={() => this.openViewer(g.items)}>
+                  {g.label}
+                </Button>
+              </Badge>
+            ))}
+          </div>
+        )}
         <DialogActions>
           <Button onClick={this.onClose} variant="contained" color="primary">
             <FormattedMessage module="claim" id="close" />

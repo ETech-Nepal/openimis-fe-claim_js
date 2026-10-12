@@ -393,5 +393,13 @@
   "claim.attachment.missingPredefinedType": "Missing predefined Type",
   "claim.attachment.definePredefinedType": "You must define the the General Type first and then select the Predefined Type or clean the attachment",
   "claim.attachment.missingDocument": "Missing Document",
-  "claim.attachment.defineDocument": "Upload a file or clean the attachment"
+  "claim.attachment.defineDocument": "Upload a file or clean the attachment",
+  "claim.attachment.preview": "Preview",
+  "claim.attachment.viewAll": "View all",
+  "claim.attachment.viewer.loading": "Loading...",
+  "claim.attachment.viewer.error": "The attachment could not be loaded.",
+  "claim.attachment.viewer.noPreview": "This file type can't be previewed.",
+  "claim.attachment.viewer.download": "Download",
+  "claim.attachment.viewer.blocked.title": "Popup blocked",
+  "claim.attachment.viewer.blocked.message": "Allow popups for this site to preview attachments."
 }
